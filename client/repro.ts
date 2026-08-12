@@ -1,17 +1,17 @@
 // Repro: the TypeScript SDK delivers WebSocket frames out of order under
 // compression, leaving the client cache holding a stale row indefinitely.
 //
-// Each iteration issues TWO concurrent writes to the SAME primary key:
+// Each iteration issues a BURST of concurrent writes to the SAME primary key:
 //
-//   write_cell(id, 1, <8MB of compressible padding>)  <- tiny on the wire, SLOW to inflate
-//   write_cell(id, 2, "")                             <- trivial to inflate
+//   write_cell(id, 1..BURST-1, <2MB of compressible padding>)  <- tiny on the wire, SLOW to inflate
+//   write_cell(id, BURST,      "")                             <- trivial to inflate
 //
-// Both are in flight together. The server commits them in order, so the final
-// value is ALWAYS 2. On the client, frame 2 finishes decompressing first,
-// `handler({data})` is called for it first, and the row's delete+insert deltas
-// are applied out of order -- leaving the client on value 1. Nothing repairs
-// it: the row is not written again, so it stays wrong for the life of the
-// subscription.
+// All are in flight together. The server commits them in order, so the row
+// always ends at BURST. On the client the final cheap frame finishes
+// decompressing before a heavy earlier one, `handler({data})` is called for it
+// first, and the row's delete+insert deltas are applied out of order -- leaving
+// the client on BURST-1. Nothing repairs it: the row is not written again, so
+// it stays wrong for the life of the subscription.
 //
 // The run uses the STOCK SDK -- no withWSFn, no instrumentation -- so the
 // result cannot be an artefact of the harness. After a miss it opens a FRESH
@@ -28,7 +28,7 @@ const URI = process.env.REPRO_STDB_URI ?? "ws://127.0.0.1:3000";
 const DB = process.env.REPRO_STDB_DB ?? "ordering-repro";
 const COMPRESSION = (process.argv[2] ?? "gzip") as "gzip" | "none";
 const ITERATIONS = Number(process.env.ITERATIONS ?? 20);
-const PADDING_BYTES = Number(process.env.PADDING_BYTES ?? 8_000_000);
+const PADDING_BYTES = Number(process.env.PADDING_BYTES ?? 2_000_000);
 const BUDGET_MS = 3_000;
 const BURST = Number(process.env.BURST ?? 8);
 
@@ -101,6 +101,7 @@ async function main() {
   const conn: any = await connect();
 
   let misses = 0;
+  let anomalies = 0;
   for (let i = 0; i < ITERATIONS; i++) {
     const id = `cell-${i}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -116,20 +117,38 @@ async function main() {
     if (ms >= 0) {
       console.log(`iter ${i}: ok (${ms}ms)`);
     } else {
-      misses++;
       const stale = read(conn, id);
       const viaFresh = await readViaFreshSubscription(conn, id);
-      console.log(
-        `iter ${i}: MISS  client=${stale}  fresh-subscription=${viaFresh}` +
-          `  <- server holds ${viaFresh}, the client's stream lost the update`,
-      );
+      if (viaFresh === BURST) {
+        misses++;
+        console.log(
+          `iter ${i}: MISS  client=${stale}  fresh-subscription=${viaFresh}` +
+            `  <- server holds ${BURST}, the client's stream lost the update`,
+        );
+      } else {
+        // The server itself never reached BURST, so this says nothing about
+        // frame ordering. Counting it would let a server-side or harness
+        // problem masquerade as the SDK bug being demonstrated.
+        anomalies++;
+        console.log(
+          `iter ${i}: ANOMALY  client=${stale}  fresh-subscription=${viaFresh}` +
+            `  <- server did not reach ${BURST}; NOT counted as a lost update`,
+        );
+      }
     }
     await sleep(150);
   }
 
-  console.log(`\nTOTAL compression=${COMPRESSION}: ${misses}/${ITERATIONS} stale`);
+  console.log(
+    `\nTOTAL compression=${COMPRESSION}: ${misses}/${ITERATIONS} stale` +
+      (anomalies ? `  (${anomalies} anomalies, excluded)` : ""),
+  );
   conn.disconnect();
-  process.exit(misses > 0 && COMPRESSION === "gzip" ? 0 : misses > 0 ? 1 : 0);
+  // Exit code states what happened, so this is usable in CI:
+  //   0 = the expected outcome (gzip reproduced, or none stayed clean)
+  //   1 = the unexpected outcome (gzip did not reproduce, or none went stale)
+  const expected = COMPRESSION === "gzip" ? misses > 0 : misses === 0;
+  process.exit(expected ? 0 : 1);
 }
 
 main().catch((e) => {

@@ -28,9 +28,17 @@ const STOCK = `  set onmessage(handler) {
 const FIXED = `  set onmessage(handler) {
     let tail = Promise.resolve();
     this.#ws.onmessage = (msg) => {
-      const raw = new Uint8Array(msg.data);
+      // Start decompression IMMEDIATELY so frames still inflate concurrently
+      // (DecompressionStream may do that work off-thread); only DELIVERY is
+      // serialised. Ordering is what matters, not exclusivity.
+      const pending = this.#decompress(new Uint8Array(msg.data));
+      // Mark the rejection handled now. The chain below may not reach this
+      // frame for several ticks, and without this an inflate failure would
+      // surface as an unhandledrejection in the meantime. The real error is
+      // still delivered to the .catch when the chain awaits it.
+      pending.catch(() => {});
       tail = tail
-        .then(async () => handler({ data: await this.#decompress(raw) }))
+        .then(async () => handler({ data: await pending }))
         .catch((e) => {
           console.error(
             "[SpacetimeDB] WebSocket decompress failed, closing socket:",

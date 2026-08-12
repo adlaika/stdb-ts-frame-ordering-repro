@@ -54,22 +54,28 @@ npm install
 # 3. reproduce (compression gzip — the DEFAULT)
 npx tsx repro.ts
 
-# 4. control (compression none — the same branch has no `await`, so it stays ordered)
+# 4. control (compression none — nothing async happens per frame, so order holds)
 npx tsx repro.ts none
 ```
 
-Knobs: `BURST` (default 8), `PADDING_BYTES` (default 8000000; 2000000 is plenty),
-`ITERATIONS` (default 20), `REPRO_STDB_URI`, `REPRO_STDB_DB`.
+Exit code is meaningful: `0` = the expected outcome (gzip reproduced, or `none` stayed
+clean), `1` = the unexpected one.
+
+Knobs, all defaulted to the values the results below were measured at: `BURST` (8),
+`PADDING_BYTES` (2000000), `ITERATIONS` (20), plus `REPRO_STDB_URI` / `REPRO_STDB_DB`.
+Deliberately **not** `STDB_URI` / `STDB_DB` — those are commonly already exported for
+another project, which silently points the repro at the wrong database and fails the
+websocket upgrade with `non-101 status code`.
 
 ## Results
 
-SpacetimeDB standalone 2.8.0 on localhost, Node 22.23.1, `spacetimedb` npm 2.8.1,
-`BURST=8 PADDING_BYTES=2000000`:
+SpacetimeDB standalone 2.8.0 on localhost, Node 22.23.1, `spacetimedb` npm 2.8.1.
+Every row is the bare command at stock defaults — no extra environment:
 
 | run | result |
 |---|---|
-| `npx tsx repro.ts` (gzip, default) | **12/20 stale** |
-| `npx tsx repro.ts none` (control) | **0/10 stale** |
+| `npx tsx repro.ts` (gzip, the default) | **15/20 stale** |
+| `npx tsx repro.ts none` (control) | **0/20 stale** |
 | gzip, with the suggested fix applied | **0/20 stale** |
 
 A miss prints:
@@ -90,15 +96,20 @@ npx tsx repro.ts                  # 0/20
 node apply-suggested-fix.mjs --revert
 ```
 
-The fix chains each frame onto the previous one, keeping decompression async:
+The fix starts decompression immediately and serialises only **delivery**, so frames
+still inflate concurrently:
 
 ```ts
 set onmessage(handler: (msg: { data: Uint8Array }) => void) {
   let tail: Promise<void> = Promise.resolve();
   this.#ws.onmessage = (msg: MessageEvent) => {
-    const raw = new Uint8Array(msg.data);
+    const pending = this.#decompress(new Uint8Array(msg.data));
+    // Mark the rejection handled now: the chain may not reach this frame for
+    // several ticks, and without this an inflate failure surfaces as an
+    // unhandledrejection in the meantime. The real error still reaches .catch.
+    pending.catch(() => {});
     tail = tail
-      .then(async () => handler({ data: await this.#decompress(raw) }))
+      .then(async () => handler({ data: await pending }))
       .catch((e) => {
         console.error('[SpacetimeDB] WebSocket decompress failed, closing socket:', e);
         this.#ws.close();
@@ -110,8 +121,9 @@ set onmessage(handler: (msg: { data: Uint8Array }) => void) {
 The `.catch` keeps one bad frame from poisoning the chain and stalling the stream,
 preserving the close-on-failure behaviour added for #5667.
 
-Throughput is unaffected in practice: JS is single-threaded, and every frame must be
-decompressed before it can be applied, so this changes only the interleaving.
+Because decompression is kicked off on arrival rather than inside the chain, frames
+still inflate concurrently — including off-thread where `DecompressionStream` does
+that — and only the order in which results are handed to the SDK changes.
 
 ## Notes
 
