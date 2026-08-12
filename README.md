@@ -127,6 +127,8 @@ that — and only the order in which results are handed to the SDK changes.
 
 ## Notes
 
+- This breaks a documented guarantee: [subscription semantics](https://spacetimedb.com/docs/clients/subscriptions/semantics) states that transaction updates "reflect the exact order of committed transactions" and that "the client cache always maintains a consistent and correct subset of the committed database state". The page's "no relative ordering guarantees ... regarding the invocation order of these callbacks" disclaimer covers callback order *within* one transaction, not the order whole transactions are applied.
+- The underlying hazard is a known JS one: an `async` handler on `ws.onmessage` reorders by resolution time despite TCP delivering in order — see Sitong Peng, ["WebSockets guarantee order — so why are my messages scrambled?"](https://www.sitongpeng.com/writing/websockets-guarantee-order-so-why-are-my-messages-scrambled) (May 2025).
 - Reproduces identically on `spacetimedb` **2.0.3** and **2.8.1**.
 - The `#inboundQueue` drain loop added to `DbConnectionImpl` in 2.8.x does **not**
   address this. It preserves the order frames arrive *at the handler*; the race is
